@@ -105,7 +105,7 @@ func cleanDropboxPath(p string) (string, error) {
 
 // relOf converts a display path ("" or "/A/b") to the os.Root-relative name ("." or "A/b").
 func relOf(display string) string {
-	if display == "" {
+	if display == "" || display == "/" {
 		return "."
 	}
 	return filepath.FromSlash(display[1:])
@@ -197,8 +197,10 @@ func fsError(err error) error {
 	return errMalformed
 }
 
+// readDir lists a directory. O_DIRECTORY makes a FIFO or device in the path fail instead of
+// blocking the open (os.Open on a FIFO waits for a writer).
 func (f *FS) readDir(rel string) ([]os.DirEntry, error) {
-	d, err := f.root.Open(rel)
+	d, err := f.root.OpenFile(rel, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -301,24 +303,35 @@ func (f *FS) forget(display string) {
 	}
 }
 
+// fileKey is the identity of a file on disk (device + inode).
+func fileKey(st os.FileInfo) string {
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprintf("%d:%d", sys.Dev, sys.Ino)
+	}
+	return st.Name()
+}
+
 // stableID derives an id from the file's identity (device + inode), so renames keep the id
 // like they do on Dropbox.
+//
+// Known limit: Dropbox ids are never reused, but an inode number can be after a file is deleted
+// outside the stub, so an old id may then name the new file. The stub only sees the disk.
 func stableID(st os.FileInfo) string {
-	var key string
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		key = fmt.Sprintf("%d:%d", sys.Dev, sys.Ino)
-	} else {
-		key = st.Name()
-	}
-	sum := sha1.Sum([]byte(key))
+	sum := sha1.Sum([]byte(fileKey(st)))
 	return "id:" + base64.RawURLEncoding.EncodeToString(sum[:])[:22]
 }
 
 // list returns the entries under the folder at display path dir (recursive walks the subtree),
 // sorted by path_lower so pages are stable. Entries os.Root cannot reach (a symlink leading out of
-// the root, a dangling link) are invisible, like files Dropbox cannot sync.
+// the root, a dangling link) are invisible, like files Dropbox cannot sync. A recursive walk enters
+// each directory (by device + inode) once, so links that point back up (a -> .) cannot make it
+// revisit the same tree under ever longer paths.
 func (f *FS) list(dir string, recursive bool) ([]Metadata, error) {
 	var out []Metadata
+	visited := map[string]bool{}
+	if st, err := f.root.Stat(relOf(dir)); err == nil {
+		visited[fileKey(st)] = true
+	}
 	var walk func(dirDisplay string) error
 	walk = func(dirDisplay string) error {
 		entries, err := f.readDir(relOf(dirDisplay))
@@ -336,7 +349,12 @@ func (f *FS) list(dir string, recursive bool) ([]Metadata, error) {
 			}
 			out = append(out, m)
 			if recursive && m.Tag == "folder" {
-				// A folder that cannot be read (removed meanwhile, a loop of links) is skipped.
+				st, err := f.root.Stat(relOf(childDisplay))
+				if err != nil || visited[fileKey(st)] {
+					continue
+				}
+				visited[fileKey(st)] = true
+				// A folder that cannot be read (removed meanwhile) is skipped.
 				_ = walk(childDisplay)
 			}
 		}

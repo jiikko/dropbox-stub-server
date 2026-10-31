@@ -237,13 +237,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		max = 100
 	}
 	terms := strings.Fields(strings.ToLower(arg.Query))
-	var matches []map[string]any
+	var matches []Metadata
 	for _, m := range entries {
 		if matchesAll(strings.ToLower(m.Name), terms) {
-			matches = append(matches, map[string]any{
-				"match_type": map[string]any{".tag": "filename"},
-				"metadata":   map[string]any{".tag": "metadata", "metadata": m},
-			})
+			matches = append(matches, m)
 		}
 	}
 	s.writeSearchPage(w, &searchState{matches: matches, pageSize: max})
@@ -256,9 +253,12 @@ func (s *Server) writeSearchPage(w http.ResponseWriter, st *searchState) {
 	if end > len(st.matches) {
 		end = len(st.matches)
 	}
-	page := st.matches[st.offset:end]
-	if page == nil {
-		page = []map[string]any{}
+	page := make([]map[string]any, 0, end-st.offset)
+	for _, m := range st.matches[st.offset:end] {
+		page = append(page, map[string]any{
+			"match_type": map[string]any{".tag": "filename"},
+			"metadata":   map[string]any{".tag": "metadata", "metadata": m},
+		})
 	}
 	resp := map[string]any{"matches": page, "has_more": end < len(st.matches)}
 	if end < len(st.matches) {
@@ -325,15 +325,15 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		writeLookupError(w, "to", err)
 		return
 	}
-	lowerFrom, lowerTo := strings.ToLower(fromDisplay), strings.ToLower(toDisplay)
-	if strings.HasPrefix(lowerTo, lowerFrom+"/") {
+	if strings.HasPrefix(strings.ToLower(toDisplay), strings.ToLower(fromDisplay)+"/") {
 		writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "cant_move_folder_into_itself"}})
 		return
 	}
-	// Dropbox names are case-insensitive, so "taken" means an entry whose name differs only in case
-	// counts too (on a case-sensitive file system os.Lstat would miss it and Rename would leave two
-	// entries, or overwrite one). Renaming an entry onto itself (a case-only rename) is not a conflict.
-	if lowerTo != lowerFrom && s.fs.exists(arg.ToPath) {
+	// Dropbox names are case-insensitive, so "taken" means any entry in the target folder whose name
+	// matches case-insensitively, including a dangling link (os.Rename would replace it). Renaming an
+	// entry onto itself (a case-only rename) is allowed only when it is the same file on disk: a root
+	// that already holds a.mp4 and A.mp4 on a case-sensitive file system must not lose one of them.
+	if taken, err := s.fs.nameTaken(toDisplay, fromRel); err != nil || taken {
 		if !arg.Autorename {
 			writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "conflict", "conflict": map[string]any{".tag": "file"}}})
 			return
@@ -360,29 +360,56 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": m})
 }
 
-// exists reports whether a Dropbox path names an entry (case-insensitively).
-func (f *FS) exists(p string) bool {
-	_, _, err := f.lookup(p)
-	return err == nil
+// takenNames returns the lower-cased names in the folder of display (a display path whose parent
+// exists). An unreadable folder is an error: callers treat it as "taken" rather than overwrite.
+func (f *FS) takenNames(display string) (map[string]os.DirEntry, error) {
+	entries, err := f.readDir(relOf(path.Dir(display)))
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]os.DirEntry, len(entries))
+	for _, e := range entries {
+		names[strings.ToLower(e.Name())] = e
+	}
+	return names, nil
 }
 
-// autorename appends " (1)", " (2)", ... before the extension until the name is free.
+// nameTaken reports whether display's name is used in its folder by an entry other than selfRel.
+func (f *FS) nameTaken(display, selfRel string) (bool, error) {
+	names, err := f.takenNames(display)
+	if err != nil {
+		return true, err
+	}
+	e, ok := names[strings.ToLower(path.Base(display))]
+	if !ok {
+		return false, nil
+	}
+	self, err1 := f.root.Lstat(selfRel)
+	other, err2 := f.root.Lstat(relOf(path.Join(path.Dir(display), e.Name())))
+	if err1 == nil && err2 == nil && os.SameFile(self, other) {
+		return false, nil // a case-only rename of the entry itself
+	}
+	return true, nil
+}
+
+// autorename appends " (1)", " (2)", ... before the extension until the name is free. The folder is
+// read once; names that cannot be created (too long for the file system) end the search.
 func (s *Server) autorename(display string) (string, string, bool) {
+	names, err := s.fs.takenNames(display)
+	if err != nil {
+		return "", "", false
+	}
 	ext := path.Ext(display)
 	base := strings.TrimSuffix(display, ext)
 	for i := 1; i <= maxAutorename; i++ {
 		candidate := base + " (" + strconv.Itoa(i) + ")" + ext
-		_, _, err := s.fs.lookup(candidate)
-		if errors.Is(err, errNotFound) {
-			// The name must also be creatable (not too long for the file system).
-			if _, statErr := s.fs.root.Lstat(relOf(candidate)); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
-				return "", "", false
-			}
-			return relOf(candidate), candidate, true
+		if _, taken := names[strings.ToLower(path.Base(candidate))]; taken {
+			continue
 		}
-		if err != nil {
+		if _, statErr := s.fs.root.Lstat(relOf(candidate)); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 			return "", "", false
 		}
+		return relOf(candidate), candidate, true
 	}
 	return "", "", false
 }

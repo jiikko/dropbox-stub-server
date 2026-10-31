@@ -5,11 +5,14 @@ import (
 	"sync"
 )
 
-// maxCursors bounds the cursors kept in memory. Every list_folder / continue / search stores a
-// full snapshot, so without a bound a client looping on them grows the stub without limit.
-// The oldest cursors are dropped first; a dropped list cursor gets the same "reset" error Dropbox
-// returns, which makes the app list the folder again.
-const maxCursors = 1000
+// maxCursors / maxSearchCursors bound the cursors kept in memory (each store separately). Every
+// list_folder / continue stores a full listing and every paged search its matches, so without a
+// bound a client looping on them grows the stub without limit. The oldest are dropped first; a
+// dropped list cursor gets the same "reset" error Dropbox returns, which makes the app list again.
+const (
+	maxCursors       = 1000
+	maxSearchCursors = 100
+)
 
 // cursorState is what a list_folder cursor points at: the listing it was taken from (to page
 // through, and to diff against on /continue once the pages are exhausted).
@@ -23,7 +26,7 @@ type cursorState struct {
 
 // searchState is what a search cursor points at.
 type searchState struct {
-	matches  []map[string]any
+	matches  []Metadata
 	pageSize int
 	offset   int
 }
@@ -31,14 +34,15 @@ type searchState struct {
 // store keeps opaque cursors in memory, at most maxCursors of them (oldest dropped first).
 type store[T any] struct {
 	prefix string
+	limit  int
 	mu     sync.Mutex
 	next   int
 	m      map[string]*T
 	order  []string
 }
 
-func newStore[T any](prefix string) *store[T] {
-	return &store[T]{prefix: prefix, m: map[string]*T{}}
+func newStore[T any](prefix string, limit int) *store[T] {
+	return &store[T]{prefix: prefix, limit: limit, m: map[string]*T{}}
 }
 
 func (c *store[T]) put(st *T) string {
@@ -48,7 +52,7 @@ func (c *store[T]) put(st *T) string {
 	id := fmt.Sprintf("%s-%d", c.prefix, c.next)
 	c.m[id] = st
 	c.order = append(c.order, id)
-	for len(c.order) > maxCursors {
+	for len(c.order) > c.limit {
 		delete(c.m, c.order[0])
 		c.order = c.order[1:]
 	}

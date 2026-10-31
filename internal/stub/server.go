@@ -48,7 +48,7 @@ func New(opts Options) (*Server, error) {
 	if opts.LongpollTimeoutUnit <= 0 {
 		opts.LongpollTimeoutUnit = time.Second
 	}
-	s := &Server{fs: fsys, opts: opts, cursors: newStore[cursorState]("stubcursor"), searches: newStore[searchState]("stubsearch"), faults: newFaultStore(), mux: http.NewServeMux()}
+	s := &Server{fs: fsys, opts: opts, cursors: newStore[cursorState]("stubcursor", maxCursors), searches: newStore[searchState]("stubsearch", maxSearchCursors), faults: newFaultStore(), mux: http.NewServeMux()}
 	s.routes()
 	return s, nil
 }

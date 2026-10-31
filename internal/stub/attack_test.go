@@ -124,8 +124,8 @@ func TestStaleIDAfterOnDiskChangeDoesNotHitAnotherFile(t *testing.T) {
 func TestIDFollowsParentRename(t *testing.T) {
 	f := newFixture(t)
 	_, meta := f.rpc("/2/files/get_metadata", map[string]any{"path": "/Videos/a.mp4"})
-	if st, _ := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos", "to_path": "/Clips"}); st != 200 {
-		t.Fatal("folder rename failed")
+	if st, body0 := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos", "to_path": "/Clips"}); st != 200 {
+		t.Fatalf("folder rename failed: %v", body0)
 	}
 	st, body := f.rpc("/2/files/get_metadata", map[string]any{"path": meta["id"]})
 	if st != 200 || body["path_display"] != "/Clips/a.mp4" {
@@ -199,5 +199,86 @@ func TestSearchPagesWithCursor(t *testing.T) {
 	_, body = f.rpc("/2/files/search/continue_v2", map[string]any{"cursor": body["cursor"]})
 	if body["has_more"] != false || len(body["matches"].([]any)) != 1 {
 		t.Fatalf("second page = %v", body)
+	}
+}
+
+func TestUnknownIDInLinkLoopsFinishes(t *testing.T) {
+	f := newFixture(t)
+	for _, n := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
+		if err := os.Symlink(".", filepath.Join(f.root, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan int, 1)
+	go func() { st, _ := f.rpc("/2/files/get_metadata", map[string]any{"path": "id:nonexistent"}); done <- st }()
+	select {
+	case st := <-done:
+		if st != 409 {
+			t.Fatalf("unknown id = %d, want 409", st)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("unknown id did not finish (the walk revisits the same directory through the links)")
+	}
+}
+
+func TestDanglingLinkNameIsTaken(t *testing.T) {
+	f := newFixture(t)
+	if err := os.Symlink("missing", filepath.Join(f.root, "taken.mp4")); err != nil {
+		t.Fatal(err)
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/taken.mp4"})
+	if st != 409 {
+		t.Fatalf("move onto a dangling link = %d %v, want conflict", st, body)
+	}
+	st, body = f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/taken.mp4", "autorename": true})
+	if st != 200 || body["metadata"].(map[string]any)["path_display"] != "/taken (1).mp4" {
+		t.Fatalf("autorename past a dangling link = %d %v", st, body)
+	}
+	if target, err := os.Readlink(filepath.Join(f.root, "taken.mp4")); err != nil || target != "missing" {
+		t.Fatalf("the dangling link was replaced: %q %v", target, err)
+	}
+}
+
+func TestExistingCaseCollisionIsNotOverwritten(t *testing.T) {
+	f := newFixture(t)
+	write(t, f.root, "c.mp4", "lower")
+	if err := os.WriteFile(filepath.Join(f.root, "C.mp4"), []byte("upper"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.root, "c.mp4")); string(got) != "lower" {
+		t.Skip("case-insensitive file system: c.mp4 and C.mp4 cannot coexist")
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/c.mp4", "to_path": "/C.mp4"})
+	if st != 409 {
+		t.Fatalf("move onto an existing case variant = %d %v, want conflict", st, body)
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.root, "C.mp4")); string(got) != "upper" {
+		t.Fatalf("C.mp4 was overwritten: %q", got)
+	}
+}
+
+func TestFIFOInTheMiddleOfAPathDoesNotBlock(t *testing.T) {
+	f := newFixture(t)
+	fifo := filepath.Join(f.root, "pipe.mp4")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	t.Cleanup(func() {
+		if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			w.Close()
+		}
+	})
+	done := make(chan struct{}, 2)
+	go func() { f.rpc("/2/files/get_metadata", map[string]any{"path": "/pipe.mp4/child"}); done <- struct{}{} }()
+	go func() {
+		f.rpc("/2/files/search_v2", map[string]any{"query": "x", "options": map[string]any{"path": "/pipe.mp4"}})
+		done <- struct{}{}
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a request through the FIFO blocked")
+		}
 	}
 }

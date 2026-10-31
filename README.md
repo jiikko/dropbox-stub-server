@@ -46,9 +46,15 @@ Replace the origin and keep the path.
 
 Any non-empty bearer token is accepted. Temporary links serve regular files only.
 
-Limits: at most 1000 cursors are kept (the oldest list cursor then gets `reset`, which makes a
-client list again). Two concurrent moves to the same free name are not serialized; the stub serves
-one local user.
+Limits:
+
+- At most 1000 list cursors and 100 search cursors are kept (the oldest list cursor then gets
+  `reset`, which makes a client list again).
+- Symlinks inside the root work only when they are relative and stay inside the root (`os.Root`
+  refuses absolute links). A recursive listing enters each directory once, so link loops end.
+- Ids come from the file's device + inode. If a file is deleted outside the stub and the inode is
+  reused, an old id can name the new file (Dropbox never reuses ids; the stub only sees the disk).
+- Two concurrent moves to the same free name are not serialized; the stub serves one local user.
 
 ## Control endpoints
 
