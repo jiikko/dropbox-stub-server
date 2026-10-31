@@ -45,6 +45,11 @@ container build -t dropbox-stub-server .
 container run --rm -p 127.0.0.1:8765:8765 -v ~/Movies/stub-root:/data dropbox-stub-server
 ```
 
+Inside the container the stub accepts connections on every interface, so other containers and
+processes on the same machine that can reach the container's address (Docker's bridge network, the
+`192.168.64.x` address Apple's `container` gives each container) can use it too. Use it only with
+files you are fine exposing to the local machine; publishing to 127.0.0.1 keeps it off other machines.
+
 Then point the app at `http://127.0.0.1:8765`. Temporary links use the address the client used, so
 they work through the published port. Files under the mount are renamed and deleted by the stub
 (it runs as root in the container).

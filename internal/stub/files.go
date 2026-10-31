@@ -330,10 +330,12 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Dropbox names are case-insensitive, so "taken" means any entry in the target folder whose name
-	// matches case-insensitively, including a dangling link (os.Rename would replace it). Renaming an
-	// entry onto itself (a case-only rename) is allowed only when it is the same file on disk: a root
-	// that already holds a.mp4 and A.mp4 on a case-sensitive file system must not lose one of them.
-	if taken, err := s.fs.nameTaken(toDisplay, fromRel); err != nil || taken {
+	// matches case-insensitively (strings.EqualFold, the same rule lookup uses), including a dangling
+	// link (os.Rename would replace it). Renaming an entry onto itself (a case-only rename) is allowed
+	// only when the source entry is the only match: a root that already holds a.mp4 and A.mp4 on a
+	// case-sensitive file system must not lose one of them, and a hard link under another name is a
+	// different entry even though it is the same file.
+	if taken, err := s.fs.nameTaken(toDisplay, fromDisplay); err != nil || taken {
 		if !arg.Autorename {
 			writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "conflict", "conflict": map[string]any{".tag": "file"}}})
 			return
@@ -360,42 +362,54 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": m})
 }
 
-// takenNames returns the lower-cased names in the folder of display (a display path whose parent
-// exists). An unreadable folder is an error: callers treat it as "taken" rather than overwrite.
-func (f *FS) takenNames(display string) (map[string]os.DirEntry, error) {
+// folderNames returns every name in the folder of display (a display path whose parent exists).
+// An unreadable folder is an error: callers treat it as "taken" rather than overwrite.
+func (f *FS) folderNames(display string) ([]string, error) {
 	entries, err := f.readDir(relOf(path.Dir(display)))
 	if err != nil {
 		return nil, err
 	}
-	names := make(map[string]os.DirEntry, len(entries))
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		names[strings.ToLower(e.Name())] = e
+		names = append(names, e.Name())
 	}
 	return names, nil
 }
 
-// nameTaken reports whether display's name is used in its folder by an entry other than selfRel.
-func (f *FS) nameTaken(display, selfRel string) (bool, error) {
-	names, err := f.takenNames(display)
+// nameTaken reports whether display's name is used in its folder (case-insensitively) by an entry
+// other than self (the source of a rename: the same folder and the same on-disk name).
+// Every matching entry is checked, not just one.
+func (f *FS) nameTaken(display, self string) (bool, error) {
+	names, err := f.folderNames(display)
 	if err != nil {
 		return true, err
 	}
-	e, ok := names[strings.ToLower(path.Base(display))]
-	if !ok {
-		return false, nil
+	dir, want := path.Dir(display), path.Base(display)
+	for _, n := range names {
+		if !strings.EqualFold(n, want) {
+			continue
+		}
+		if path.Dir(self) == dir && path.Base(self) == n {
+			continue // the source entry itself (a case-only rename)
+		}
+		return true, nil
 	}
-	self, err1 := f.root.Lstat(selfRel)
-	other, err2 := f.root.Lstat(relOf(path.Join(path.Dir(display), e.Name())))
-	if err1 == nil && err2 == nil && os.SameFile(self, other) {
-		return false, nil // a case-only rename of the entry itself
+	return false, nil
+}
+
+func foldMember(names []string, name string) bool {
+	for _, n := range names {
+		if strings.EqualFold(n, name) {
+			return true
+		}
 	}
-	return true, nil
+	return false
 }
 
 // autorename appends " (1)", " (2)", ... before the extension until the name is free. The folder is
 // read once; names that cannot be created (too long for the file system) end the search.
 func (s *Server) autorename(display string) (string, string, bool) {
-	names, err := s.fs.takenNames(display)
+	names, err := s.fs.folderNames(display)
 	if err != nil {
 		return "", "", false
 	}
@@ -403,7 +417,7 @@ func (s *Server) autorename(display string) (string, string, bool) {
 	base := strings.TrimSuffix(display, ext)
 	for i := 1; i <= maxAutorename; i++ {
 		candidate := base + " (" + strconv.Itoa(i) + ")" + ext
-		if _, taken := names[strings.ToLower(path.Base(candidate))]; taken {
+		if foldMember(names, path.Base(candidate)) {
 			continue
 		}
 		if _, statErr := s.fs.root.Lstat(relOf(candidate)); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {

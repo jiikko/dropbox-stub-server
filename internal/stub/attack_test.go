@@ -282,3 +282,42 @@ func TestFIFOInTheMiddleOfAPathDoesNotBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestHardLinkUnderAnotherNameIsTaken(t *testing.T) {
+	f := newFixture(t)
+	if err := os.Link(filepath.Join(f.root, "Videos", "a.mp4"), filepath.Join(f.root, "Videos", "b.mp4")); err != nil {
+		t.Skipf("link: %v", err)
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/Videos/b.mp4"})
+	if st != 409 {
+		t.Fatalf("move onto a hard link of itself under another name = %d %v, want conflict", st, body)
+	}
+}
+
+func TestCaseCollisionIsCheckedInBothDirections(t *testing.T) {
+	f := newFixture(t)
+	write(t, f.root, "c.mp4", "lower")
+	if err := os.WriteFile(filepath.Join(f.root, "C.mp4"), []byte("upper"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.root, "c.mp4")); string(got) != "lower" {
+		t.Skip("case-insensitive file system: c.mp4 and C.mp4 cannot coexist")
+	}
+	for _, mv := range [][2]string{{"/c.mp4", "/C.mp4"}, {"/C.mp4", "/c.mp4"}} {
+		if st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": mv[0], "to_path": mv[1]}); st != 409 {
+			t.Fatalf("move %s -> %s = %d %v, want conflict", mv[0], mv[1], st, body)
+		}
+	}
+}
+
+func TestFoldEquivalentNameIsTaken(t *testing.T) {
+	f := newFixture(t)
+	// U+017F (long s) folds to "s" under strings.EqualFold, which lookup uses; the name check must agree.
+	write(t, f.root, "ſ.mp4", "long s")
+	if got, err := os.ReadFile(filepath.Join(f.root, "s.mp4")); err == nil && string(got) == "long s" {
+		t.Skip("the file system folds long s to s itself")
+	}
+	if st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/s.mp4"}); st != 409 {
+		t.Fatalf("move onto a fold-equivalent name = %d %v, want conflict", st, body)
+	}
+}

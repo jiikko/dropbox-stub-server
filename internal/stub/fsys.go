@@ -90,7 +90,7 @@ func cleanDropboxPath(p string) (string, error) {
 		return "", errMalformed
 	}
 	for _, seg := range strings.Split(p[1:], "/") {
-		// The app never sends these; rejecting them keeps the error explicit instead of relying on
+		// The app never sends these; rejecting them keeps the error clear instead of relying on
 		// os.Root to refuse the climb.
 		if seg == ".." || seg == "." {
 			return "", errMalformed

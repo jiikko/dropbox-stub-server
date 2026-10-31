@@ -40,7 +40,7 @@ func run(root, addr string, quiet, allowNonLoopback bool) error {
 	// so it must never be reachable from another machine.
 	// Inside a container, loopback is the container's own and the host cannot reach it, so the
 	// container listens on all interfaces and the host publishes the port to its 127.0.0.1 only
-	// (README "Run in a container"). The flag makes that an explicit choice.
+	// (README "Run in a container"). The flag makes that a deliberate choice.
 	if allowNonLoopback {
 		fmt.Fprintf(os.Stderr, "dropbox-stub-server: -allow-non-loopback: listening on %s; publish the port to the host's 127.0.0.1 only\n", addr)
 	} else if err := requireLoopback(addr); err != nil {
