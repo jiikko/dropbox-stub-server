@@ -126,9 +126,18 @@ func TestMoveOntoCaseVariantIsAConflict(t *testing.T) {
 
 func TestContentRefusesFIFO(t *testing.T) {
 	f := newFixture(t)
-	if err := syscall.Mkfifo(filepath.Join(f.root, "pipe.mp4"), 0o644); err != nil {
+	fifo := filepath.Join(f.root, "pipe.mp4")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
 		t.Skipf("mkfifo: %v", err)
 	}
+	// If the server does block on the FIFO (the regression), attach a writer at the end so the
+	// blocked open returns and httptest.Server.Close (registered earlier, so it runs later) does not
+	// wait forever: the regression then shows up as a failure instead of a hung test.
+	t.Cleanup(func() {
+		if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			w.Close()
+		}
+	})
 	_, body := f.rpc("/2/files/get_temporary_link", map[string]any{"path": "/pipe.mp4"})
 	link, _ := body["link"].(string)
 	if link == "" {
