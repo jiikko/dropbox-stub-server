@@ -99,6 +99,28 @@ func TestStaleIDDoesNotHitAnotherFile(t *testing.T) {
 	}
 }
 
+// The id cache can go stale without the stub seeing it (files changed directly on disk, e.g. in
+// Finder): the cached path then holds another file, and the id must not resolve to it.
+func TestStaleIDAfterOnDiskChangeDoesNotHitAnotherFile(t *testing.T) {
+	f := newFixture(t)
+	write(t, f.root, "b.mp4", "bbb")
+	_, meta := f.rpc("/2/files/get_metadata", map[string]any{"path": "/Videos/a.mp4"})
+	id := meta["id"].(string)
+	a := filepath.Join(f.root, "Videos", "a.mp4")
+	if err := os.Remove(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(f.root, "b.mp4"), a); err != nil {
+		t.Fatal(err)
+	}
+	if st, body := f.rpc("/2/files/delete_v2", map[string]any{"path": id}); st == 200 {
+		t.Fatalf("stale id deleted another file: %v", body)
+	}
+	if _, err := os.Stat(a); err != nil {
+		t.Fatalf("the other file was deleted: %v", err)
+	}
+}
+
 func TestIDFollowsParentRename(t *testing.T) {
 	f := newFixture(t)
 	_, meta := f.rpc("/2/files/get_metadata", map[string]any{"path": "/Videos/a.mp4"})
