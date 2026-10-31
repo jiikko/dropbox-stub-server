@@ -1,0 +1,4 @@
+tmp/
+.git/
+*.test
+dropbox-stub-server

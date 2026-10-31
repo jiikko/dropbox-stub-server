@@ -24,6 +24,31 @@ Requests are logged to stderr (`-quiet` turns that off).
 that performs the operation) any path that leaves the root, including through symlinks. Links that
 lead out of the root are not listed.
 
+## Run in a container
+
+The `Dockerfile` builds a small image (static binary on distroless). Mount the directory to serve at
+`/data` and publish the port **to the host's 127.0.0.1 only**: inside the container the stub listens
+on all interfaces (`-allow-non-loopback`), because the container's own loopback is unreachable from
+the host.
+
+Docker:
+
+```sh
+docker build -t dropbox-stub-server .
+docker run --rm -p 127.0.0.1:8765:8765 -v ~/Movies/stub-root:/data dropbox-stub-server
+```
+
+Apple's [`container`](https://github.com/apple/container) (macOS):
+
+```sh
+container build -t dropbox-stub-server .
+container run --rm -p 127.0.0.1:8765:8765 -v ~/Movies/stub-root:/data dropbox-stub-server
+```
+
+Then point the app at `http://127.0.0.1:8765`. Temporary links use the address the client used, so
+they work through the published port. Files under the mount are renamed and deleted by the stub
+(it runs as root in the container).
+
 ## Pointing an app at it
 
 Every endpoint is served from the one origin, whatever host the real API uses

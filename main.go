@@ -22,21 +22,28 @@ func main() {
 	root := flag.String("root", "", "directory served as the Dropbox root (required)")
 	addr := flag.String("addr", "127.0.0.1:8765", "listen address (loopback only)")
 	quiet := flag.Bool("quiet", false, "do not log requests")
+	allowNonLoopback := flag.Bool("allow-non-loopback", false,
+		"listen on a non-loopback -addr; only for running inside a container whose port is published to the host's 127.0.0.1")
 	flag.Parse()
 
-	if err := run(*root, *addr, *quiet); err != nil {
+	if err := run(*root, *addr, *quiet, *allowNonLoopback); err != nil {
 		fmt.Fprintln(os.Stderr, "dropbox-stub-server:", err)
 		os.Exit(1)
 	}
 }
 
-func run(root, addr string, quiet bool) error {
+func run(root, addr string, quiet, allowNonLoopback bool) error {
 	if root == "" {
 		return errors.New("-root is required")
 	}
 	// The stub has no authentication and can read, move and delete everything under root,
 	// so it must never be reachable from another machine.
-	if err := requireLoopback(addr); err != nil {
+	// Inside a container, loopback is the container's own and the host cannot reach it, so the
+	// container listens on all interfaces and the host publishes the port to its 127.0.0.1 only
+	// (README "Run in a container"). The flag makes that an explicit choice.
+	if allowNonLoopback {
+		fmt.Fprintf(os.Stderr, "dropbox-stub-server: -allow-non-loopback: listening on %s; publish the port to the host's 127.0.0.1 only\n", addr)
+	} else if err := requireLoopback(addr); err != nil {
 		return err
 	}
 	var logger *log.Logger
