@@ -430,7 +430,6 @@ func (f *FS) sameDir(a, b string) bool {
 	return err1 == nil && err2 == nil && os.SameFile(sa, sb)
 }
 
-
 func foldMember(names []string, name string) bool {
 	for _, n := range names {
 		if strings.EqualFold(n, name) {
