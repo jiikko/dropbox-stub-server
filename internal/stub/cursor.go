@@ -5,10 +5,15 @@ import (
 	"sync"
 )
 
+// maxCursors bounds the cursors kept in memory. Every list_folder / continue / search stores a
+// full snapshot, so without a bound a client looping on them grows the stub without limit.
+// The oldest cursors are dropped first; a dropped list cursor gets the same "reset" error Dropbox
+// returns, which makes the app list the folder again.
+const maxCursors = 1000
+
 // cursorState is what a list_folder cursor points at: the listing it was taken from (to page
 // through, and to diff against on /continue once the pages are exhausted).
 type cursorState struct {
-	abs       string
 	display   string
 	recursive bool
 	limit     int
@@ -16,31 +21,51 @@ type cursorState struct {
 	offset    int        // next index into snapshot to return
 }
 
-// cursorStore keeps cursors in memory. Cursors are opaque strings; an unknown cursor (for
-// example after a stub restart) gets the same "reset" error Dropbox returns, which makes the app
-// list the folder again.
-type cursorStore struct {
-	mu   sync.Mutex
-	next int
-	m    map[string]*cursorState
+// searchState is what a search cursor points at.
+type searchState struct {
+	matches  []map[string]any
+	pageSize int
+	offset   int
 }
 
-func newCursorStore() *cursorStore { return &cursorStore{m: map[string]*cursorState{}} }
+// store keeps opaque cursors in memory, at most maxCursors of them (oldest dropped first).
+type store[T any] struct {
+	prefix string
+	mu     sync.Mutex
+	next   int
+	m      map[string]*T
+	order  []string
+}
 
-func (c *cursorStore) put(st *cursorState) string {
+func newStore[T any](prefix string) *store[T] {
+	return &store[T]{prefix: prefix, m: map[string]*T{}}
+}
+
+func (c *store[T]) put(st *T) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.next++
-	id := fmt.Sprintf("stubcursor-%d", c.next)
+	id := fmt.Sprintf("%s-%d", c.prefix, c.next)
 	c.m[id] = st
+	c.order = append(c.order, id)
+	for len(c.order) > maxCursors {
+		delete(c.m, c.order[0])
+		c.order = c.order[1:]
+	}
 	return id
 }
 
-func (c *cursorStore) get(id string) (*cursorState, bool) {
+func (c *store[T]) get(id string) (*T, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st, ok := c.m[id]
 	return st, ok
+}
+
+func (c *store[T]) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
 }
 
 // diff returns what changed from old to cur as Dropbox list_folder entries: added or modified

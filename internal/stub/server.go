@@ -28,11 +28,12 @@ type Options struct {
 
 // Server is an http.Handler serving the Dropbox API subset the app uses.
 type Server struct {
-	fs      *FS
-	opts    Options
-	cursors *cursorStore
-	faults  *faultStore
-	mux     *http.ServeMux
+	fs       *FS
+	opts     Options
+	cursors  *store[cursorState]
+	searches *store[searchState]
+	faults   *faultStore
+	mux      *http.ServeMux
 }
 
 // New creates a Server.
@@ -47,7 +48,7 @@ func New(opts Options) (*Server, error) {
 	if opts.LongpollTimeoutUnit <= 0 {
 		opts.LongpollTimeoutUnit = time.Second
 	}
-	s := &Server{fs: fsys, opts: opts, cursors: newCursorStore(), faults: newFaultStore(), mux: http.NewServeMux()}
+	s := &Server{fs: fsys, opts: opts, cursors: newStore[cursorState]("stubcursor"), searches: newStore[searchState]("stubsearch"), faults: newFaultStore(), mux: http.NewServeMux()}
 	s.routes()
 	return s, nil
 }
@@ -62,6 +63,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /2/files/get_metadata", s.authed(s.handleGetMetadata))
 	s.mux.HandleFunc("POST /2/files/get_temporary_link", s.authed(s.handleGetTemporaryLink))
 	s.mux.HandleFunc("POST /2/files/search_v2", s.authed(s.handleSearch))
+	s.mux.HandleFunc("POST /2/files/search/continue_v2", s.authed(s.handleSearchContinue))
 	s.mux.HandleFunc("POST /2/files/move_v2", s.authed(s.handleMove))
 	s.mux.HandleFunc("POST /2/files/delete_v2", s.authed(s.handleDelete))
 	s.mux.HandleFunc("POST /oauth2/token", s.handleToken)
@@ -184,7 +186,7 @@ func writeLookupError(w http.ResponseWriter, field string, err error) {
 	switch {
 	case errors.Is(err, errNotFound):
 		tag = "not_found"
-	case errors.Is(err, errMalformed), errors.Is(err, errOutsideRoot):
+	case errors.Is(err, errMalformed):
 		tag = "malformed_path"
 	default:
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error_summary": "internal_error/..", "error": map[string]any{".tag": "internal_error"}, "detail": err.Error()})

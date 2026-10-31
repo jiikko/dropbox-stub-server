@@ -36,7 +36,7 @@ func (s *Server) handleLongpoll(w http.ResponseWriter, r *http.Request) {
 	want := fingerprint(st.snapshot)
 	deadline := time.Now().Add(time.Duration(timeout) * s.opts.LongpollTimeoutUnit)
 	for {
-		cur, err := s.fs.list(st.abs, st.display, st.recursive)
+		cur, err := s.fs.list(st.display, st.recursive)
 		if err != nil || fingerprint(cur) != want {
 			// A folder that disappeared also counts as a change: /continue will then report reset.
 			writeJSON(w, http.StatusOK, map[string]any{"changes": true})

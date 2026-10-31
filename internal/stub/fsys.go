@@ -16,11 +16,10 @@ import (
 	"time"
 )
 
-// errNotFound / errOutsideRoot are mapped to Dropbox-style 409 errors by the handlers.
+// errNotFound / errMalformed are mapped to Dropbox-style 409 errors by the handlers.
 var (
-	errNotFound    = errors.New("not_found")
-	errOutsideRoot = errors.New("outside_root")
-	errMalformed   = errors.New("malformed_path")
+	errNotFound  = errors.New("not_found")
+	errMalformed = errors.New("malformed_path")
 )
 
 // ignoredNames are files the real Dropbox client never syncs, so the stub never lists them either.
@@ -34,17 +33,25 @@ var ignoredNames = map[string]bool{
 
 // FS maps Dropbox paths ("" = root, "/a/b") onto a local directory.
 //
+// Every file operation goes through an *os.Root. os.Root refuses, at the system-call level, any
+// path whose resolution leaves the root (a ".." component, or a symlink that points outside), and
+// it resolves the path in the same call that performs the operation. So there is no window between
+// "checked that it is inside" and "deleted / opened / renamed it" (TOCTOU), and a symlink inside
+// the root that leads out of it cannot be used to reach outside files. The FS never touches files
+// through plain os.* path functions.
+//
 // Dropbox paths are case-insensitive. Lookups walk each component and fall back to a
 // case-insensitive match, so the stub behaves the same on case-sensitive file systems (Linux CI)
 // as on the default macOS one. path_display uses the on-disk spelling.
 type FS struct {
-	root string // absolute, symlinks resolved
+	root    *os.Root
+	rootDir string // absolute, symlinks resolved; for display only
 
 	mu  sync.Mutex
-	ids map[string]string // "id:..." -> display path, filled as metadata is produced
+	ids map[string]string // "id:..." -> display path, a cache verified on every use
 }
 
-// NewFS resolves root (it must be an existing directory).
+// NewFS opens root (it must be an existing directory).
 func NewFS(root string) (*FS, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -54,18 +61,24 @@ func NewFS(root string) (*FS, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := os.Stat(real)
+	r, err := os.OpenRoot(real)
 	if err != nil {
 		return nil, err
 	}
+	st, err := r.Stat(".")
+	if err != nil {
+		r.Close()
+		return nil, err
+	}
 	if !st.IsDir() {
+		r.Close()
 		return nil, fmt.Errorf("root %q is not a directory", root)
 	}
-	return &FS{root: real, ids: map[string]string{}}, nil
+	return &FS{root: r, rootDir: real, ids: map[string]string{}}, nil
 }
 
 // Root returns the resolved root directory.
-func (f *FS) Root() string { return f.root }
+func (f *FS) Root() string { return f.rootDir }
 
 // cleanDropboxPath validates the syntax of a Dropbox path and returns its cleaned form
 // ("" for the root, otherwise "/a/b" without a trailing slash).
@@ -73,12 +86,12 @@ func cleanDropboxPath(p string) (string, error) {
 	if p == "" || p == "/" {
 		return "", nil
 	}
-	if !strings.HasPrefix(p, "/") {
+	if !strings.HasPrefix(p, "/") || strings.ContainsRune(p, 0) {
 		return "", errMalformed
 	}
 	for _, seg := range strings.Split(p[1:], "/") {
-		// Reject ".." outright instead of letting path.Clean fold it: a request that tries to
-		// climb is a bug or an attack, never something the app sends.
+		// The app never sends these; rejecting them keeps the error explicit instead of relying on
+		// os.Root to refuse the climb.
 		if seg == ".." || seg == "." {
 			return "", errMalformed
 		}
@@ -90,42 +103,71 @@ func cleanDropboxPath(p string) (string, error) {
 	return c, nil
 }
 
-// lookup resolves a Dropbox path (or "id:...") to an existing on-disk path and its display path.
-func (f *FS) lookup(p string) (abs, display string, err error) {
+// relOf converts a display path ("" or "/A/b") to the os.Root-relative name ("." or "A/b").
+func relOf(display string) string {
+	if display == "" {
+		return "."
+	}
+	return filepath.FromSlash(display[1:])
+}
+
+// lookup resolves a Dropbox path (or "id:...") to an existing entry: its os.Root-relative name and
+// its display path.
+func (f *FS) lookup(p string) (rel, display string, err error) {
 	if strings.HasPrefix(p, "id:") {
-		f.mu.Lock()
-		d, ok := f.ids[p]
-		f.mu.Unlock()
-		if !ok {
-			return "", "", errNotFound
-		}
-		p = d
+		return f.lookupID(p)
 	}
 	clean, err := cleanDropboxPath(p)
 	if err != nil {
 		return "", "", err
 	}
-	cur := f.root
 	display = ""
 	if clean != "" {
 		for _, seg := range strings.Split(clean[1:], "/") {
-			name, err := matchName(cur, seg)
+			name, err := f.matchName(relOf(display), seg)
 			if err != nil {
 				return "", "", err
 			}
-			cur = filepath.Join(cur, name)
 			display += "/" + name
 		}
 	}
-	if err := f.checkInside(cur); err != nil {
-		return "", "", err
+	rel = relOf(display)
+	if _, err := f.root.Stat(rel); err != nil {
+		return "", "", fsError(err)
 	}
-	return cur, display, nil
+	return rel, display, nil
 }
 
-// lookupParent resolves the parent of a (possibly not yet existing) Dropbox path and returns
-// the on-disk path the entry would have.
-func (f *FS) lookupParent(p string) (abs, display string, err error) {
+// lookupID finds the entry whose stable id is id. The cache is only a hint: the entry it points at
+// must still have that id (a deleted file's path may now hold another file), otherwise the tree is
+// searched (a parent folder may have been renamed).
+func (f *FS) lookupID(id string) (string, string, error) {
+	f.mu.Lock()
+	cached, ok := f.ids[id]
+	f.mu.Unlock()
+	if ok {
+		if st, err := f.root.Stat(relOf(cached)); err == nil && stableID(st) == id {
+			return relOf(cached), cached, nil
+		}
+		f.mu.Lock()
+		delete(f.ids, id)
+		f.mu.Unlock()
+	}
+	entries, err := f.list("", true)
+	if err != nil {
+		return "", "", err
+	}
+	for _, m := range entries {
+		if m.ID == id {
+			return relOf(m.PathDisplay), m.PathDisplay, nil
+		}
+	}
+	return "", "", errNotFound
+}
+
+// lookupParent resolves the parent of a (possibly not yet existing) Dropbox path and returns the
+// os.Root-relative name and display path the entry would have.
+func (f *FS) lookupParent(p string) (rel, display string, err error) {
 	clean, err := cleanDropboxPath(p)
 	if err != nil {
 		return "", "", err
@@ -134,44 +176,46 @@ func (f *FS) lookupParent(p string) (abs, display string, err error) {
 		return "", "", errMalformed
 	}
 	dir, name := path.Split(clean)
-	parentAbs, parentDisplay, err := f.lookup(strings.TrimSuffix(dir, "/"))
+	_, parentDisplay, err := f.lookup(strings.TrimSuffix(dir, "/"))
 	if err != nil {
 		return "", "", err
 	}
 	if ignoredNames[name] {
 		return "", "", errMalformed
 	}
-	return filepath.Join(parentAbs, name), parentDisplay + "/" + name, nil
+	display = parentDisplay + "/" + name
+	return relOf(display), display, nil
 }
 
-// checkInside rejects paths whose real location (after symlinks) is outside the root.
-func (f *FS) checkInside(abs string) error {
-	real, err := filepath.EvalSymlinks(abs)
+// fsError maps os errors (including os.Root's "path escapes from parent") to lookup errors.
+func fsError(err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return errNotFound
+	}
+	// os.Root reports a path that would leave the root as an error that is neither of the above;
+	// the stub treats it like a malformed path (the entry does not exist from the app's view).
+	return errMalformed
+}
+
+func (f *FS) readDir(rel string) ([]os.DirEntry, error) {
+	d, err := f.root.Open(rel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return errNotFound
-		}
-		return err
+		return nil, err
 	}
-	if real != f.root && !strings.HasPrefix(real, f.root+string(filepath.Separator)) {
-		return errOutsideRoot
-	}
-	return nil
+	defer d.Close()
+	return d.ReadDir(-1)
 }
 
-func matchName(dir, seg string) (string, error) {
+func (f *FS) matchName(dirRel, seg string) (string, error) {
 	if ignoredNames[seg] {
 		return "", errNotFound
 	}
 	// Always read the directory instead of stat-ing seg: on a case-insensitive file system
 	// (the macOS default) stat("videos") succeeds for "Videos", and path_display would echo the
 	// requested spelling instead of the on-disk one.
-	entries, err := os.ReadDir(dir)
+	entries, err := f.readDir(dirRel)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return "", errNotFound
-		}
-		return "", err
+		return "", fsError(err)
 	}
 	folded := ""
 	for _, e := range entries {
@@ -205,15 +249,11 @@ type Metadata struct {
 	IsDownloadable *bool  `json:"is_downloadable,omitempty"`
 }
 
-// metadataFor builds the metadata of an existing entry. Symlinks are followed only when they stay
-// inside the root (checked by the caller via lookup / list).
-func (f *FS) metadataFor(abs, display string) (Metadata, error) {
-	st, err := os.Stat(abs)
+// metadataFor builds the metadata of an existing entry (symlinks inside the root are followed).
+func (f *FS) metadataFor(display string) (Metadata, error) {
+	st, err := f.root.Stat(relOf(display))
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return Metadata{}, errNotFound
-		}
-		return Metadata{}, err
+		return Metadata{}, fsError(err)
 	}
 	name := path.Base(display)
 	if display == "" {
@@ -248,6 +288,19 @@ func (f *FS) metadataFor(abs, display string) (Metadata, error) {
 	return m, nil
 }
 
+// forget drops cached ids under display (after a delete or a move).
+func (f *FS) forget(display string) {
+	lower := strings.ToLower(display)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, d := range f.ids {
+		dl := strings.ToLower(d)
+		if dl == lower || strings.HasPrefix(dl, lower+"/") {
+			delete(f.ids, id)
+		}
+	}
+}
+
 // stableID derives an id from the file's identity (device + inode), so renames keep the id
 // like they do on Dropbox.
 func stableID(st os.FileInfo) string {
@@ -262,41 +315,34 @@ func stableID(st os.FileInfo) string {
 }
 
 // list returns the entries under the folder at display path dir (recursive walks the subtree),
-// sorted by path_lower so pages are stable.
-func (f *FS) list(abs, display string, recursive bool) ([]Metadata, error) {
+// sorted by path_lower so pages are stable. Entries os.Root cannot reach (a symlink leading out of
+// the root, a dangling link) are invisible, like files Dropbox cannot sync.
+func (f *FS) list(dir string, recursive bool) ([]Metadata, error) {
 	var out []Metadata
-	var walk func(dirAbs, dirDisplay string) error
-	walk = func(dirAbs, dirDisplay string) error {
-		entries, err := os.ReadDir(dirAbs)
+	var walk func(dirDisplay string) error
+	walk = func(dirDisplay string) error {
+		entries, err := f.readDir(relOf(dirDisplay))
 		if err != nil {
-			return err
+			return fsError(err)
 		}
 		for _, e := range entries {
 			if ignoredNames[e.Name()] {
 				continue
 			}
-			childAbs := filepath.Join(dirAbs, e.Name())
 			childDisplay := dirDisplay + "/" + e.Name()
-			if f.checkInside(childAbs) != nil {
-				continue // dangling symlink or a link out of the root: invisible, like a file Dropbox cannot sync
-			}
-			m, err := f.metadataFor(childAbs, childDisplay)
+			m, err := f.metadataFor(childDisplay)
 			if err != nil {
-				if errors.Is(err, errNotFound) {
-					continue // removed while listing
-				}
-				return err
+				continue // removed while listing, or unreachable through os.Root
 			}
 			out = append(out, m)
 			if recursive && m.Tag == "folder" {
-				if err := walk(childAbs, childDisplay); err != nil {
-					return err
-				}
+				// A folder that cannot be read (removed meanwhile, a loop of links) is skipped.
+				_ = walk(childDisplay)
 			}
 		}
 		return nil
 	}
-	if err := walk(abs, display); err != nil {
+	if err := walk(dir); err != nil {
 		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].PathLower < out[j].PathLower })

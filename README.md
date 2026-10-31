@@ -19,8 +19,10 @@ The first line on stdout is `dropbox-stub-server listening on http://...` (scrip
 Requests are logged to stderr (`-quiet` turns that off).
 
 **Safety**: there is no authentication, and everything under `-root` can be moved and deleted.
-`-addr` only accepts loopback addresses. Paths with `..`, and symlinks that lead outside the
-root, are rejected (links out of the root are not listed).
+`-addr` only accepts loopback addresses. Every file operation goes through Go's
+[`os.Root`](https://pkg.go.dev/os#Root), which refuses (at the system-call level, in the same call
+that performs the operation) any path that leaves the root, including through symlinks. Links that
+lead out of the root are not listed.
 
 ## Pointing an app at it
 
@@ -35,14 +37,18 @@ Replace the origin and keep the path.
 | `POST /2/files/list_folder/longpoll` | Waits up to `timeout` seconds (30–480) for the folder to change. No `Authorization` header, like the real one. |
 | `POST /2/files/get_metadata` | `path/not_found` (409) when missing. |
 | `POST /2/files/get_temporary_link` | A link back to the stub that serves the file with `Range` support. |
-| `POST /2/files/search_v2` | Case-insensitive file name match (all words must match). |
-| `POST /2/files/move_v2` | Renames / moves on disk. `autorename` adds ` (1)`. The `id` survives a rename. |
+| `POST /2/files/search_v2` / `search/continue_v2` | Case-insensitive file name match (all words must match), paged by `max_results` with a cursor. |
+| `POST /2/files/move_v2` | Renames / moves on disk. A name that differs only in case counts as taken (`autorename` adds ` (1)`). The `id` survives a rename, including a rename of a parent folder. |
 | `POST /2/files/delete_v2` | Deletes on disk (folders recursively). |
-| `POST /2/files/get_thumbnail_v2` / `get_thumbnail_batch` | A solid-color JPEG of the requested size (color derived from the path) for image and video files; `unsupported_extension` otherwise. |
+| `POST /2/files/get_thumbnail_v2` / `get_thumbnail_batch` | A solid-color JPEG (color derived from the path) for image and video files; `unsupported_extension` otherwise. Only the sizes Dropbox accepts (`w32h32` … `w2048h1536`). |
 | `GET /oauth2/authorize` | Redirects straight back to `redirect_uri` (loopback http only) with `code` and the original `state`. |
 | `POST /oauth2/token` | Fixed tokens for `authorization_code` (with `refresh_token`) and `refresh_token` grants. |
 
-Any non-empty bearer token is accepted.
+Any non-empty bearer token is accepted. Temporary links serve regular files only.
+
+Limits: at most 1000 cursors are kept (the oldest list cursor then gets `reset`, which makes a
+client list again). Two concurrent moves to the same free name are not serialized; the stub serves
+one local user.
 
 ## Control endpoints
 

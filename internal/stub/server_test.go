@@ -350,7 +350,7 @@ func TestThumbnails(t *testing.T) {
 	f := newFixture(t)
 	req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/2/files/get_thumbnail_v2", nil)
 	req.Header.Set("Authorization", "Bearer t")
-	req.Header.Set("Dropbox-API-Arg", `{"resource":{".tag":"path","path":"/Videos/a.mp4"},"format":"jpeg","size":"w64h32","mode":"strict"}`)
+	req.Header.Set("Dropbox-API-Arg", `{"resource":{".tag":"path","path":"/Videos/a.mp4"},"format":"jpeg","size":"w64h64","mode":"strict"}`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

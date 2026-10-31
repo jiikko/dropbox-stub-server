@@ -6,14 +6,18 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
 	defaultListLimit = 2000
 	maxListLimit     = 2000
+	// maxAutorename bounds the " (N)" search so a name that can never be free (too long for the
+	// file system, permission errors) ends with a conflict instead of looping forever.
+	maxAutorename = 1000
 )
 
 func (s *Server) handleListFolder(w http.ResponseWriter, r *http.Request) {
@@ -26,16 +30,21 @@ func (s *Server) handleListFolder(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid JSON: %v", err)
 		return
 	}
-	abs, display, err := s.fs.lookup(arg.Path)
+	_, display, err := s.fs.lookup(arg.Path)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
 	}
-	if st, err := os.Stat(abs); err != nil || !st.IsDir() {
+	m, err := s.fs.metadataFor(display)
+	if err != nil {
+		writeLookupError(w, "path", err)
+		return
+	}
+	if display != "" && m.Tag != "folder" {
 		writeError(w, http.StatusConflict, "path", map[string]any{"path": map[string]any{".tag": "not_folder"}})
 		return
 	}
-	entries, err := s.fs.list(abs, display, arg.Recursive)
+	entries, err := s.fs.list(display, arg.Recursive)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
@@ -44,7 +53,7 @@ func (s *Server) handleListFolder(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > maxListLimit {
 		limit = defaultListLimit
 	}
-	st := &cursorState{abs: abs, display: display, recursive: arg.Recursive, limit: limit, snapshot: entries}
+	st := &cursorState{display: display, recursive: arg.Recursive, limit: limit, snapshot: entries}
 	s.writePage(w, st)
 }
 
@@ -86,13 +95,10 @@ func (s *Server) handleListFolderContinue(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// All pages were returned: report what changed since the snapshot, like Dropbox's delta.
-	cur, err := s.fs.list(st.abs, st.display, st.recursive)
+	cur, err := s.fs.list(st.display, st.recursive)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			writeError(w, http.StatusConflict, "reset", nil)
-			return
-		}
-		writeLookupError(w, "path", err)
+		// The folder itself is gone (or unreachable): the app lists again after a reset.
+		writeError(w, http.StatusConflict, "reset", nil)
 		return
 	}
 	changes := diff(st.snapshot, cur)
@@ -122,12 +128,12 @@ func (s *Server) handleGetMetadata(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "request body: path: the root folder is unsupported")
 		return
 	}
-	abs, display, err := s.fs.lookup(arg.Path)
+	_, display, err := s.fs.lookup(arg.Path)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
 	}
-	m, err := s.fs.metadataFor(abs, display)
+	m, err := s.fs.metadataFor(display)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
@@ -143,12 +149,12 @@ func (s *Server) handleGetTemporaryLink(w http.ResponseWriter, r *http.Request) 
 		badRequest(w, "invalid JSON: %v", err)
 		return
 	}
-	abs, display, err := s.fs.lookup(arg.Path)
+	_, display, err := s.fs.lookup(arg.Path)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
 	}
-	m, err := s.fs.metadataFor(abs, display)
+	m, err := s.fs.metadataFor(display)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
@@ -175,30 +181,33 @@ func baseURL(r *http.Request) string {
 }
 
 // handleContent serves a temporary link. http.ServeContent handles Range, which seeking needs.
+// Only regular files are served: a FIFO or a device would block the open (or never end).
 func (s *Server) handleContent(w http.ResponseWriter, r *http.Request) {
 	raw, err := base64.RawURLEncoding.DecodeString(r.PathValue("token"))
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	abs, display, err := s.fs.lookup(string(raw))
+	rel, display, err := s.fs.lookup(string(raw))
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := os.Open(abs)
+	// O_NONBLOCK keeps a FIFO swapped in after the lookup from blocking the open; the fstat below
+	// then refuses anything that is not a regular file.
+	f, err := s.fs.root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	defer f.Close()
 	st, err := f.Stat()
-	if err != nil || st.IsDir() {
+	if err != nil || !st.Mode().IsRegular() {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	http.ServeContent(w, r, filepath.Base(display), st.ModTime(), f)
+	http.ServeContent(w, r, path.Base(display), st.ModTime(), f)
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -213,12 +222,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid JSON: %v", err)
 		return
 	}
-	abs, display, err := s.fs.lookup(arg.Options.Path)
+	_, display, err := s.fs.lookup(arg.Options.Path)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
 	}
-	entries, err := s.fs.list(abs, display, true)
+	entries, err := s.fs.list(display, true)
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
@@ -228,22 +237,52 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		max = 100
 	}
 	terms := strings.Fields(strings.ToLower(arg.Query))
-	matches := []map[string]any{}
-	hasMore := false
+	var matches []map[string]any
 	for _, m := range entries {
-		if !matchesAll(strings.ToLower(m.Name), terms) {
-			continue
+		if matchesAll(strings.ToLower(m.Name), terms) {
+			matches = append(matches, map[string]any{
+				"match_type": map[string]any{".tag": "filename"},
+				"metadata":   map[string]any{".tag": "metadata", "metadata": m},
+			})
 		}
-		if len(matches) == max {
-			hasMore = true
-			break
-		}
-		matches = append(matches, map[string]any{
-			"match_type": map[string]any{".tag": "filename"},
-			"metadata":   map[string]any{".tag": "metadata", "metadata": m},
-		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"matches": matches, "has_more": hasMore})
+	s.writeSearchPage(w, &searchState{matches: matches, pageSize: max})
+}
+
+// writeSearchPage returns one page of a search; a cursor for /2/files/search/continue_v2 comes with
+// has_more, like the real API.
+func (s *Server) writeSearchPage(w http.ResponseWriter, st *searchState) {
+	end := st.offset + st.pageSize
+	if end > len(st.matches) {
+		end = len(st.matches)
+	}
+	page := st.matches[st.offset:end]
+	if page == nil {
+		page = []map[string]any{}
+	}
+	resp := map[string]any{"matches": page, "has_more": end < len(st.matches)}
+	if end < len(st.matches) {
+		next := *st
+		next.offset = end
+		resp["cursor"] = s.searches.put(&next)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSearchContinue(w http.ResponseWriter, r *http.Request) {
+	var arg struct {
+		Cursor string `json:"cursor"`
+	}
+	if err := decodeArg(r, &arg); err != nil {
+		badRequest(w, "invalid JSON: %v", err)
+		return
+	}
+	st, ok := s.searches.get(arg.Cursor)
+	if !ok {
+		writeError(w, http.StatusConflict, "internal_error", nil)
+		return
+	}
+	s.writeSearchPage(w, st)
 }
 
 func matchesAll(name string, terms []string) bool {
@@ -268,16 +307,16 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid JSON: %v", err)
 		return
 	}
-	fromAbs, _, err := s.fs.lookup(arg.FromPath)
+	fromRel, fromDisplay, err := s.fs.lookup(arg.FromPath)
 	if err != nil {
 		writeLookupError(w, "from_lookup", err)
 		return
 	}
-	if fromAbs == s.fs.Root() {
+	if fromRel == "." {
 		writeError(w, http.StatusConflict, "from_lookup", map[string]any{"from_lookup": map[string]any{".tag": "malformed_path"}})
 		return
 	}
-	toAbs, toDisplay, err := s.fs.lookupParent(arg.ToPath)
+	toRel, toDisplay, err := s.fs.lookupParent(arg.ToPath)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
 			writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "no_write_permission"}})
@@ -286,24 +325,34 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		writeLookupError(w, "to", err)
 		return
 	}
-	if !strings.EqualFold(fromAbs, toAbs) { // a case-only rename is allowed onto "itself"
-		if _, err := os.Lstat(toAbs); err == nil {
-			if !arg.Autorename {
-				writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "conflict", "conflict": map[string]any{".tag": "file"}}})
-				return
-			}
-			toAbs, toDisplay = autorename(toAbs, toDisplay)
-		}
-	}
-	if strings.HasPrefix(toAbs+string(filepath.Separator), fromAbs+string(filepath.Separator)) && !strings.EqualFold(fromAbs, toAbs) {
+	lowerFrom, lowerTo := strings.ToLower(fromDisplay), strings.ToLower(toDisplay)
+	if strings.HasPrefix(lowerTo, lowerFrom+"/") {
 		writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "cant_move_folder_into_itself"}})
 		return
 	}
-	if err := os.Rename(fromAbs, toAbs); err != nil {
-		writeLookupError(w, "from_lookup", err)
+	// Dropbox names are case-insensitive, so "taken" means an entry whose name differs only in case
+	// counts too (on a case-sensitive file system os.Lstat would miss it and Rename would leave two
+	// entries, or overwrite one). Renaming an entry onto itself (a case-only rename) is not a conflict.
+	if lowerTo != lowerFrom && s.fs.exists(arg.ToPath) {
+		if !arg.Autorename {
+			writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "conflict", "conflict": map[string]any{".tag": "file"}}})
+			return
+		}
+		var ok bool
+		toRel, toDisplay, ok = s.autorename(toDisplay)
+		if !ok {
+			writeError(w, http.StatusConflict, "to", map[string]any{"to": map[string]any{".tag": "conflict", "conflict": map[string]any{".tag": "file"}}})
+			return
+		}
+	}
+	// Known limit: two concurrent moves to the same free name can both pass the check above; the
+	// stub serves one local user, so it does not lock across requests.
+	if err := s.fs.root.Rename(fromRel, toRel); err != nil {
+		writeLookupError(w, "from_lookup", fsError(err))
 		return
 	}
-	m, err := s.fs.metadataFor(toAbs, toDisplay)
+	s.fs.forget(fromDisplay)
+	m, err := s.fs.metadataFor(toDisplay)
 	if err != nil {
 		writeLookupError(w, "to", err)
 		return
@@ -311,17 +360,31 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": m})
 }
 
+// exists reports whether a Dropbox path names an entry (case-insensitively).
+func (f *FS) exists(p string) bool {
+	_, _, err := f.lookup(p)
+	return err == nil
+}
+
 // autorename appends " (1)", " (2)", ... before the extension until the name is free.
-func autorename(abs, display string) (string, string) {
-	ext := filepath.Ext(abs)
-	baseAbs := strings.TrimSuffix(abs, ext)
-	baseDisplay := strings.TrimSuffix(display, ext)
-	for i := 1; ; i++ {
-		suffix := " (" + strconv.Itoa(i) + ")" + ext
-		if _, err := os.Lstat(baseAbs + suffix); errors.Is(err, fs.ErrNotExist) {
-			return baseAbs + suffix, baseDisplay + suffix
+func (s *Server) autorename(display string) (string, string, bool) {
+	ext := path.Ext(display)
+	base := strings.TrimSuffix(display, ext)
+	for i := 1; i <= maxAutorename; i++ {
+		candidate := base + " (" + strconv.Itoa(i) + ")" + ext
+		_, _, err := s.fs.lookup(candidate)
+		if errors.Is(err, errNotFound) {
+			// The name must also be creatable (not too long for the file system).
+			if _, statErr := s.fs.root.Lstat(relOf(candidate)); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+				return "", "", false
+			}
+			return relOf(candidate), candidate, true
+		}
+		if err != nil {
+			return "", "", false
 		}
 	}
+	return "", "", false
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -332,23 +395,24 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid JSON: %v", err)
 		return
 	}
-	abs, display, err := s.fs.lookup(arg.Path)
+	rel, display, err := s.fs.lookup(arg.Path)
 	if err != nil {
 		writeLookupError(w, "path_lookup", err)
 		return
 	}
-	if abs == s.fs.Root() {
+	if rel == "." {
 		writeError(w, http.StatusConflict, "path_lookup", map[string]any{"path_lookup": map[string]any{".tag": "malformed_path"}})
 		return
 	}
-	m, err := s.fs.metadataFor(abs, display)
+	m, err := s.fs.metadataFor(display)
 	if err != nil {
 		writeLookupError(w, "path_lookup", err)
 		return
 	}
-	if err := os.RemoveAll(abs); err != nil {
-		writeLookupError(w, "path_lookup", err)
+	if err := s.fs.root.RemoveAll(rel); err != nil {
+		writeLookupError(w, "path_lookup", fsError(err))
 		return
 	}
+	s.fs.forget(display)
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": m})
 }

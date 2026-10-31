@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"hash/fnv"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"net/http"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -23,7 +23,15 @@ var thumbnailable = map[string]bool{
 	".flv": true, ".mpg": true, ".mpeg": true, ".3gp": true, ".ts": true,
 }
 
-var sizeRe = regexp.MustCompile(`^w(\d+)h(\d+)$`)
+// thumbnailSizes are the sizes Dropbox accepts. Anything else is refused, which also bounds the
+// image the stub allocates (an arbitrary "w100000h100000" would ask for tens of GB).
+var thumbnailSizes = map[string][2]int{
+	"w32h32": {32, 32}, "w64h64": {64, 64}, "w128h128": {128, 128}, "w256h256": {256, 256},
+	"w480h320": {480, 320}, "w640h480": {640, 480}, "w960h640": {960, 640}, "w1024h768": {1024, 768},
+	"w2048h1536": {2048, 1536},
+}
+
+var errBadSize = errors.New("unsupported thumbnail size")
 
 // union accepts both the shorthand ("jpeg") and the tagged ({".tag": "jpeg"}) union forms.
 type union string
@@ -62,21 +70,24 @@ func (a thumbArg) path() string {
 // renderThumbnail returns a JPEG of the requested size, colored by the path so different files
 // look different in the UI.
 func (s *Server) renderThumbnail(arg thumbArg) (Metadata, []byte, map[string]any, error) {
-	abs, display, err := s.fs.lookup(arg.path())
+	w, h := 256, 256
+	if arg.Size != "" {
+		wh, ok := thumbnailSizes[string(arg.Size)]
+		if !ok {
+			return Metadata{}, nil, nil, errBadSize
+		}
+		w, h = wh[0], wh[1]
+	}
+	_, display, err := s.fs.lookup(arg.path())
 	if err != nil {
 		return Metadata{}, nil, nil, err
 	}
-	m, err := s.fs.metadataFor(abs, display)
+	m, err := s.fs.metadataFor(display)
 	if err != nil {
 		return Metadata{}, nil, nil, err
 	}
 	if m.Tag != "file" || !thumbnailable[strings.ToLower(filepath.Ext(display))] {
 		return m, nil, map[string]any{".tag": "unsupported_extension"}, nil
-	}
-	w, h := 256, 256
-	if mm := sizeRe.FindStringSubmatch(string(arg.Size)); mm != nil {
-		w, _ = strconv.Atoi(mm[1])
-		h, _ = strconv.Atoi(mm[2])
 	}
 	hsh := fnv.New32a()
 	hsh.Write([]byte(m.PathLower))
@@ -102,6 +113,10 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, data, failure, err := s.renderThumbnail(arg)
+	if errors.Is(err, errBadSize) {
+		badRequest(w, "Dropbox-API-Arg: size: unsupported value %q", arg.Size)
+		return
+	}
 	if err != nil {
 		writeLookupError(w, "path", err)
 		return
@@ -133,6 +148,9 @@ func (s *Server) handleThumbnailBatch(w http.ResponseWriter, r *http.Request) {
 	for _, e := range arg.Entries {
 		m, data, failure, err := s.renderThumbnail(e)
 		switch {
+		case errors.Is(err, errBadSize):
+			badRequest(w, "request body: entries: size: unsupported value %q", e.Size)
+			return
 		case err != nil:
 			out = append(out, map[string]any{".tag": "failure", "failure": map[string]any{".tag": "path", "path": map[string]any{".tag": "not_found"}}})
 		case failure != nil:
