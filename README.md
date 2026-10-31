@@ -85,6 +85,14 @@ Limits:
 - Ids come from the file's device + inode. If a file is deleted outside the stub and the inode is
   reused, an old id can name the new file (Dropbox never reuses ids; the stub only sees the disk).
 - Two concurrent moves to the same free name are not serialized; the stub serves one local user.
+- Renaming a file onto a hard link of itself whose name differs only by Unicode normalization is a
+  no-op that still answers 200 (nothing is lost).
+
+What the stub defends against, and what it does not: it is a development tool for one local user.
+It keeps every request inside `-root` (through `os.Root`), refuses non-loopback listening outside a
+container, bounds memory per request (thumbnail sizes, cursors) and does not overwrite an existing
+entry on rename. It does not authenticate requests, and it does not defend against other local
+processes changing files under `-root` at the same time.
 
 ## Control endpoints
 

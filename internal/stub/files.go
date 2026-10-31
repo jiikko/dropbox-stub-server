@@ -387,7 +387,10 @@ func (f *FS) folderNames(display string) ([]string, error) {
 //
 // "self" is the same directory entry: the same folder (compared by identity, so a folder reached
 // through a symlink alias counts) and the same on-disk name. A hard link under another name is a
-// different entry.
+// different entry; it is caught by the name check when its name matches the target.
+//
+// Known limit: if the file system resolves the target to a hard link of the source whose name only
+// differs by Unicode normalization, the rename is a no-op that still answers 200 (nothing is lost).
 func (f *FS) nameTaken(display, self string) (bool, error) {
 	names, err := f.folderNames(display)
 	if err != nil {
@@ -411,7 +414,7 @@ func (f *FS) nameTaken(display, self string) (bool, error) {
 	if err != nil {
 		return true, err
 	}
-	if src, err := f.root.Lstat(relOf(self)); err == nil && sameFolder && os.SameFile(src, target) && f.onlyEntryFor(names, self) {
+	if src, err := f.root.Lstat(relOf(self)); err == nil && sameFolder && os.SameFile(src, target) {
 		return false, nil // the file system resolved the new spelling to the source entry itself
 	}
 	return true, nil
@@ -427,24 +430,6 @@ func (f *FS) sameDir(a, b string) bool {
 	return err1 == nil && err2 == nil && os.SameFile(sa, sb)
 }
 
-// onlyEntryFor reports whether self's inode has no other name in the folder (so a target that
-// resolves to the same inode can only be self, not a hard link under another name).
-func (f *FS) onlyEntryFor(names []string, self string) bool {
-	src, err := f.root.Lstat(relOf(self))
-	if err != nil {
-		return false
-	}
-	dir := path.Dir(self)
-	for _, n := range names {
-		if n == path.Base(self) {
-			continue
-		}
-		if st, err := f.root.Lstat(relOf(path.Join(dir, n))); err == nil && os.SameFile(src, st) {
-			return false
-		}
-	}
-	return true
-}
 
 func foldMember(names []string, name string) bool {
 	for _, n := range names {

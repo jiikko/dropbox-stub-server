@@ -355,3 +355,14 @@ func TestCaseOnlyRenameThroughFolderAlias(t *testing.T) {
 		t.Fatalf("Videos = %v, want a.mp4 renamed to A.mp4", names)
 	}
 }
+
+func TestCaseOnlyRenameWithUnrelatedHardLink(t *testing.T) {
+	f := newFixture(t)
+	if err := os.Link(filepath.Join(f.root, "Videos", "a.mp4"), filepath.Join(f.root, "Videos", "other.mp4")); err != nil {
+		t.Skipf("link: %v", err)
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/Videos/A.mp4"})
+	if st != 200 || body["metadata"].(map[string]any)["path_display"] != "/Videos/A.mp4" {
+		t.Fatalf("case-only rename next to an unrelated hard link = %d %v, want 200 to /Videos/A.mp4", st, body)
+	}
+}
