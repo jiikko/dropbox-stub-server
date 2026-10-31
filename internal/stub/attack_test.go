@@ -321,3 +321,37 @@ func TestFoldEquivalentNameIsTaken(t *testing.T) {
 		t.Fatalf("move onto a fold-equivalent name = %d %v, want conflict", st, body)
 	}
 }
+
+func TestNormalizationEquivalentNameIsTaken(t *testing.T) {
+	f := newFixture(t)
+	write(t, f.root, "é.mp4", "decomposed") // é as e + combining acute
+	if _, err := os.Stat(filepath.Join(f.root, "é.mp4")); err != nil {
+		t.Skip("the file system does not treat composed and decomposed names as the same")
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/é.mp4"})
+	if st != 409 {
+		t.Fatalf("move onto a normalization-equivalent name = %d %v, want conflict", st, body)
+	}
+	if got, _ := os.ReadFile(filepath.Join(f.root, "é.mp4")); string(got) != "decomposed" {
+		t.Fatalf("the existing file was overwritten: %q", got)
+	}
+}
+
+func TestCaseOnlyRenameThroughFolderAlias(t *testing.T) {
+	f := newFixture(t)
+	if err := os.Symlink("Videos", filepath.Join(f.root, "Alias")); err != nil {
+		t.Fatal(err)
+	}
+	st, body := f.rpc("/2/files/move_v2", map[string]any{"from_path": "/Videos/a.mp4", "to_path": "/Alias/A.mp4"})
+	if st != 200 {
+		t.Fatalf("case-only rename through a folder alias = %d %v, want 200", st, body)
+	}
+	entries, _ := os.ReadDir(filepath.Join(f.root, "Videos"))
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if !strings.Contains(strings.Join(names, ","), "A.mp4") || strings.Contains(strings.Join(names, ","), "A (1).mp4") {
+		t.Fatalf("Videos = %v, want a.mp4 renamed to A.mp4", names)
+	}
+}

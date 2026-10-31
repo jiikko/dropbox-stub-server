@@ -376,25 +376,74 @@ func (f *FS) folderNames(display string) ([]string, error) {
 	return names, nil
 }
 
-// nameTaken reports whether display's name is used in its folder (case-insensitively) by an entry
-// other than self (the source of a rename: the same folder and the same on-disk name).
-// Every matching entry is checked, not just one.
+// nameTaken reports whether display's name is used in its folder by an entry other than self (the
+// source of a rename). Two checks, because the names Dropbox treats as equal and the names the file
+// system treats as equal differ:
+//   - by name: every entry whose name matches case-insensitively (strings.EqualFold, the rule lookup
+//     uses), except self;
+//   - by the file system: if the target name resolves to an existing entry (the file system may fold
+//     case or Unicode normalization, as APFS does for "é" composed vs decomposed), it is taken unless
+//     it is self.
+//
+// "self" is the same directory entry: the same folder (compared by identity, so a folder reached
+// through a symlink alias counts) and the same on-disk name. A hard link under another name is a
+// different entry.
 func (f *FS) nameTaken(display, self string) (bool, error) {
 	names, err := f.folderNames(display)
 	if err != nil {
 		return true, err
 	}
-	dir, want := path.Dir(display), path.Base(display)
+	sameFolder := f.sameDir(path.Dir(self), path.Dir(display))
+	want := path.Base(display)
 	for _, n := range names {
 		if !strings.EqualFold(n, want) {
 			continue
 		}
-		if path.Dir(self) == dir && path.Base(self) == n {
+		if sameFolder && path.Base(self) == n {
 			continue // the source entry itself (a case-only rename)
 		}
 		return true, nil
 	}
-	return false, nil
+	target, err := f.root.Lstat(relOf(display))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	if src, err := f.root.Lstat(relOf(self)); err == nil && sameFolder && os.SameFile(src, target) && f.onlyEntryFor(names, self) {
+		return false, nil // the file system resolved the new spelling to the source entry itself
+	}
+	return true, nil
+}
+
+// sameDir reports whether two display paths name the same directory on disk.
+func (f *FS) sameDir(a, b string) bool {
+	if a == b {
+		return true
+	}
+	sa, err1 := f.root.Stat(relOf(a))
+	sb, err2 := f.root.Stat(relOf(b))
+	return err1 == nil && err2 == nil && os.SameFile(sa, sb)
+}
+
+// onlyEntryFor reports whether self's inode has no other name in the folder (so a target that
+// resolves to the same inode can only be self, not a hard link under another name).
+func (f *FS) onlyEntryFor(names []string, self string) bool {
+	src, err := f.root.Lstat(relOf(self))
+	if err != nil {
+		return false
+	}
+	dir := path.Dir(self)
+	for _, n := range names {
+		if n == path.Base(self) {
+			continue
+		}
+		if st, err := f.root.Lstat(relOf(path.Join(dir, n))); err == nil && os.SameFile(src, st) {
+			return false
+		}
+	}
+	return true
 }
 
 func foldMember(names []string, name string) bool {
@@ -420,7 +469,11 @@ func (s *Server) autorename(display string) (string, string, bool) {
 		if foldMember(names, path.Base(candidate)) {
 			continue
 		}
-		if _, statErr := s.fs.root.Lstat(relOf(candidate)); statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		_, statErr := s.fs.root.Lstat(relOf(candidate))
+		if statErr == nil {
+			continue // the file system resolves this spelling to an existing entry (normalization, case)
+		}
+		if !errors.Is(statErr, fs.ErrNotExist) {
 			return "", "", false
 		}
 		return relOf(candidate), candidate, true
