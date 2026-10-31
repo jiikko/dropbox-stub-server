@@ -404,14 +404,17 @@ func TestOAuth(t *testing.T) {
 	if resp.StatusCode != 302 || loc.Host != "localhost:43823" || loc.Query().Get("code") == "" || loc.Query().Get("state") != "s1" {
 		t.Fatalf("authorize = %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	q.Set("redirect_uri", "https://evil.example/cb")
-	resp, err = client.Get(f.srv.URL + "/oauth2/authorize?" + q.Encode())
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 400 {
-		t.Fatalf("non-loopback redirect = %d", resp.StatusCode)
+	// Both checks matter: a non-http scheme, and an http URL to another host (the open-redirect case).
+	for _, bad := range []string{"https://evil.example/cb", "http://evil.example/cb", "http://192.168.1.2/cb"} {
+		q.Set("redirect_uri", bad)
+		resp, err = client.Get(f.srv.URL + "/oauth2/authorize?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("redirect to %s = %d, want 400", bad, resp.StatusCode)
+		}
 	}
 
 	resp, err = http.PostForm(f.srv.URL+"/oauth2/token", url.Values{"grant_type": {"authorization_code"}, "code": {"c"}})
