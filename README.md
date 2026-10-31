@@ -60,19 +60,40 @@ Every endpoint is served from the one origin, whatever host the real API uses
 (`api.dropboxapi.com` / `content.dropboxapi.com` / `notify.dropboxapi.com` / `www.dropbox.com`).
 Replace the origin and keep the path.
 
-| Real endpoint | Behavior |
-|---|---|
-| `POST /2/files/list_folder` | Lists the folder (`recursive` and `limit` supported). Paths are case-insensitive; `path_display` uses the on-disk spelling. `.DS_Store` and other files Dropbox never syncs are hidden. |
-| `POST /2/files/list_folder/continue` | Next page; once all pages are returned, the changes since then (added / modified entries, `.tag: deleted` for removed ones). Unknown cursors get `reset`. |
-| `POST /2/files/list_folder/longpoll` | Waits up to `timeout` seconds (30–480) for the folder to change. No `Authorization` header, like the real one. |
-| `POST /2/files/get_metadata` | `path/not_found` (409) when missing. |
-| `POST /2/files/get_temporary_link` | A link back to the stub that serves the file with `Range` support. |
-| `POST /2/files/search_v2` / `search/continue_v2` | Case-insensitive file name match (all words must match), paged by `max_results` with a cursor. |
-| `POST /2/files/move_v2` | Renames / moves on disk. A name that differs only in case counts as taken (`autorename` adds ` (1)`). The `id` survives a rename, including a rename of a parent folder. |
-| `POST /2/files/delete_v2` | Deletes on disk (folders recursively). |
-| `POST /2/files/get_thumbnail_v2` / `get_thumbnail_batch` | A solid-color JPEG (color derived from the path) for image and video files; `unsupported_extension` otherwise. Only the sizes Dropbox accepts (`w32h32` … `w2048h1536`). |
-| `GET /oauth2/authorize` | Redirects straight back to `redirect_uri` (loopback http only) with `code` and the original `state`. |
-| `POST /oauth2/token` | Fixed tokens for `authorization_code` (with `refresh_token`) and `refresh_token` grants. |
+The official API reference is at [docs.dropboxapi.com](https://docs.dropboxapi.com/dropbox-api/api-reference/overview). The stub implements the routes the app uses; any other route returns 404.
+
+| Endpoint (official reference) | Real host | Status | Stub behavior |
+|---|---|---|---|
+| [`GET /oauth2/authorize`](https://docs.dropboxapi.com/dropbox-api/docs/oauth) | www | ✅ Implemented | Redirects straight back to `redirect_uri` (loopback http only) with `code` and the original `state`. |
+| [`POST /oauth2/token`](https://docs.dropboxapi.com/dropbox-api/docs/oauth) | api | ✅ Implemented | Fixed tokens for `authorization_code` (with `refresh_token`) and `refresh_token` grants. |
+| [`POST /2/files/list_folder`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/list-folder) | api | ✅ Implemented | Lists the folder (`recursive` and `limit` supported). Paths are case-insensitive; `path_display` uses the on-disk spelling. `.DS_Store` and other files Dropbox never syncs are hidden. |
+| [`POST /2/files/list_folder/continue`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/list-folder-continue) | api | ✅ Implemented | Next page; once all pages are returned, the changes since then (added / modified entries, `.tag: deleted` for removed ones). Unknown cursors get `reset`. |
+| [`POST /2/files/list_folder/longpoll`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/list-folder-longpoll) | notify | ✅ Implemented | Waits up to `timeout` seconds (30–480) for the folder to change. No `Authorization` header, like the real one. |
+| [`POST /2/files/get_metadata`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-metadata) | api | ✅ Implemented | `path/not_found` (409) when missing. Accepts `id:` paths. |
+| [`POST /2/files/get_temporary_link`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-temporary-link) | api | ✅ Implemented | A link back to the stub that serves the file with `Range` support (regular files only). |
+| [`POST /2/files/search_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/search-v-2) | api | ✅ Implemented | Case-insensitive file name match (all words must match), paged by `max_results` with a cursor. |
+| [`POST /2/files/search/continue_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/search-continue-v-2) | api | ✅ Implemented | The next page of a search. |
+| [`POST /2/files/move_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/move-v-2) | api | ✅ Implemented | Renames / moves on disk. A name that differs only in case counts as taken (`autorename` adds ` (1)`). The `id` survives a rename, including a rename of a parent folder. |
+| [`POST /2/files/delete_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/delete-v-2) | api | ✅ Implemented | Deletes on disk (folders recursively). |
+| [`POST /2/files/get_thumbnail_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-thumbnail-v-2) | content | ✅ Implemented | A solid-color JPEG (color derived from the path) for image and video files; `unsupported_extension` otherwise. Only the sizes Dropbox accepts (`w32h32` … `w2048h1536`). |
+| [`POST /2/files/get_thumbnail_batch`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-thumbnail-batch) | content | ✅ Implemented | Same images as `get_thumbnail_v2`, base64 in the JSON `entries`, in request order (max 25). |
+| [`POST /2/files/list_folder/get_latest_cursor`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/list-folder-get-latest-cursor) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/copy_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/copy-v-2) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/create_folder_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/create-folder-v-2) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/upload`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/upload) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/get_temporary_upload_link`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-temporary-upload-link) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/download`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/download) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/download_zip`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/download-zip) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/get_preview`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/get-preview) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/delete_batch`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/delete-batch) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/move_batch_v2`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/move-batch-v-2) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/list_revisions`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/list-revisions) | — | ❌ Not implemented | 404 |
+| [`POST /2/files/restore`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/files/restore) | — | ❌ Not implemented | 404 |
+| [`POST /2/users/get_current_account`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/users/get-current-account) | — | ❌ Not implemented | 404 |
+| [`POST /2/users/get_space_usage`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/users/get-space-usage) | — | ❌ Not implemented | 404 |
+| [`POST /2/auth/token/revoke`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/auth/token-revoke) | — | ❌ Not implemented | 404 |
+| [`POST /2/sharing/create_shared_link_with_settings`](https://docs.dropboxapi.com/dropbox-api/api-reference/user-endpoints/sharing/create-shared-link-with-settings) | — | ❌ Not implemented | 404 |
+| Everything else (sharing, team, file requests, paper, …) | — | ❌ Not implemented | 404 |
 
 Any non-empty bearer token is accepted. Temporary links serve regular files only.
 
